@@ -3,10 +3,66 @@ var PASS = "csee@4321";
 var KEY = "findit_v3";
 var me = null, sec = "upload", q = "", photo = "";
 var db = load();
+var firebaseReady = false, dbRef = null, pendingLocalData = db;
 
 function load() { try { var s = localStorage.getItem(KEY); if (s) return JSON.parse(s); } catch (e) {} return { items: [], notes: [] }; }
-function save() { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { toast("Storage full - use a smaller photo"); } }
-window.addEventListener("storage", function (e) { if (e.key === KEY) { db = load(); renderBoard(); if (me && sec === "search") list(); } });
+function normalizeData(data) {
+  data = data || { items: [], notes: [] };
+  function asArray(value) { return Array.isArray(value) ? value : (value ? Object.keys(value).sort(function(a,b){return Number(a)-Number(b);}).map(function(k){return value[k];}) : []); }
+  data.items = asArray(data.items).filter(Boolean);
+  data.notes = asArray(data.notes).filter(Boolean);
+  data.items.forEach(function(i){ if (!Array.isArray(i.claims)) i.claims = []; });
+  return data;
+}
+function save() {
+  try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { toast("Local backup full"); }
+  if (firebaseReady && dbRef) {
+    dbRef.set(db).catch(function(error){ toast("Cloud save failed: " + error.message); });
+  }
+}
+function isAdmin() { return !!me && me.id === "358"; }
+
+/* Firebase sign-in + real-time cloud sync. Existing local data is copied only if cloud is empty. */
+function startFirebase() {
+  try {
+    var firebaseConfig = {
+      apiKey: "AIzaSyDlm2kWeVLJR-LmcomapI5NO8M7eUql--c",
+      authDomain: "findit-csee.firebaseapp.com",
+      databaseURL: "https://findit-csee-default-rtdb.asia-southeast1.firebasedatabase.app",
+      projectId: "findit-csee",
+      storageBucket: "findit-csee.firebasestorage.app",
+      messagingSenderId: "148454573901",
+      appId: "1:148454573901:web:487da86051d4d31f4a5904"
+    };
+    if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
+    firebase.auth().signInAnonymously().then(function(){
+      dbRef = firebase.database().ref("findit");
+      dbRef.on("value", function(snapshot){
+        var cloudData = snapshot.val();
+        if (cloudData) {
+          db = normalizeData(cloudData);
+          firebaseReady = true;
+          try { localStorage.setItem(KEY, JSON.stringify(db)); } catch(e) {}
+          render();
+        } else {
+          firebaseReady = true;
+          var oldData = normalizeData(pendingLocalData);
+          if (oldData.items.length || oldData.notes.length) {
+            db = oldData;
+            dbRef.set(db).catch(function(error){ toast("Cloud migration failed: " + error.message); });
+          } else {
+            db = {items:[], notes:[]};
+            dbRef.set(db).catch(function(error){ toast("Cloud setup failed: " + error.message); });
+          }
+          render();
+        }
+      }, function(error){ toast("Database error: " + error.message); });
+    }).catch(function(error){ toast("Firebase login failed: " + error.message); });
+  } catch (error) {
+    toast("Firebase could not start. Check Firebase scripts and config.");
+    console.error(error);
+  }
+}
 
 function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
 function norm(s) { return String(s).trim().replace(/\s+/g, " ").toLowerCase(); }
@@ -64,12 +120,12 @@ function card(i, act, top) {
 
 /* ---------- section 1: Upload Item (finder) ---------- */
 function uploadView() {
-  var my = db.items.filter(function (i) { return i.by === me.id; });
+  var my = db.items.filter(function (i) { return isAdmin() || i.by === me.id; });
   return '<div class="card"><h3>Upload the item you found</h3><label>Item name</label><input id="lt" maxlength="60" placeholder="e.g. Bottle, book, charger">' +
     '<label>Description (colour, brand, marks)</label><textarea id="ld"></textarea><label>Where did you find it?</label><input id="lp" placeholder="e.g. Room E-204">' +
     '<label>Photo</label><input type="file" accept="image/*" onchange="pick(this)"><div id="prev" style="margin-top:8px"></div>' +
     '<div style="margin-top:14px"><button class="btn" onclick="submitItem()">Upload</button></div></div>' +
-    '<h3 style="margin:18px 0 10px">My uploads and claim requests</h3>' +
+    '<h3 style="margin:18px 0 10px">' + (isAdmin() ? 'All uploads and claim requests (Admin)' : 'My uploads and claim requests') + '</h3>' +
     (my.length ? '<div class="grid gc">' + my.map(function (i) {
       var a = "";
       if (i.status === "pending") {
@@ -106,16 +162,17 @@ function submitItem() {
 }
 function decide(id, by, ok) {
   var i = db.items.filter(function (x) { return x.id === id; })[0];
-  i.claims.forEach(function (c) { if (c.by === by) c.status = ok ? "approved" : "rejected"; else if (ok && c.status === "requested") c.status = "rejected"; });
+  if (!i || (!isAdmin() && i.by !== me.id)) { toast("Only the finder or Admin can manage claims"); return; }
+  i.claims.forEach(function (c) { if (c.by === by && c.status === "requested") c.status = ok ? "approved" : "rejected"; else if (ok && c.status === "requested") c.status = "rejected"; });
   if (ok) i.status = "returned";
   db.notes.push({ to: by, text: "Your claim for " + i.title + " was " + (ok ? "confirmed. Collect it from " + me.name + " (" + me.id + ")." : "rejected."), t: Date.now() });
   save(); toast(ok ? "Item marked as returned" : "Claim rejected"); render();
 }
 
-/* ---------- delete: only the uploader can delete his/her own item ---------- */
+/* ---------- delete: uploader or Admin can delete an item ---------- */
 var delArm = null, delT;
 function delBtn(i) {
-  if (!me || i.by !== me.id) return "";
+  if (!me || (!isAdmin() && i.by !== me.id)) return "";
   return '<button class="btn s no" onclick="askDelete(' + i.id + ')">' + (delArm === i.id ? "Click again to confirm delete" : "🗑 Delete (wrong upload)") + "</button>";
 }
 function askDelete(id) {
@@ -123,13 +180,12 @@ function askDelete(id) {
   delArm = id; render(); clearTimeout(delT); delT = setTimeout(function () { delArm = null; if (me) render(); }, 4000);
 }
 function deleteItem(id) {
-  db = load(); /* use the latest saved data */
   var i = db.items.filter(function (x) { return x.id === id; })[0];
   if (!me || !i) { delArm = null; render(); return; }
-  if (i.by !== me.id) { toast("You can delete only your own uploads"); delArm = null; render(); return; } /* strict check */
+  if (!isAdmin() && i.by !== me.id) { toast("You can delete only your own uploads"); delArm = null; render(); return; }
   i.claims.forEach(function (c) { if (c.status === "requested") db.notes.push({ to: c.by, text: "The item " + i.title + " you claimed was removed by the finder.", t: Date.now() }); });
   db.items = db.items.filter(function (x) { return x.id !== id; });
-  save(); delArm = null; toast("Your item was deleted"); render();
+  save(); delArm = null; toast(isAdmin() && i.by !== me.id ? "Item deleted by Admin" : "Your item was deleted"); render();
 }
 
 /* ---------- section 2: Search Item (owner) ---------- */
@@ -178,7 +234,9 @@ function list() {
     (hit.length && rest.length ? '<h3 style="margin:14px 0 10px">Other items</h3>' : "") + (rest.length ? grid(rest) : "");
 }
 function claim(id) {
-  var i = db.items.filter(function (x) { return x.id === id; })[0], m = document.getElementById("m" + id).value.trim();
+  var i = db.items.filter(function (x) { return x.id === id; })[0];
+  if (!i || i.status === "returned") { toast("This item is no longer available"); return; }
+  var m = document.getElementById("m" + id).value.trim();
   if (!m) { toast("Add a proof or description"); return; }
   i.claims.push({ by: me.id, byName: me.name, msg: m, status: "requested" });
   db.notes.push({ to: i.by, text: me.name + " (" + me.id + ") claims the item you uploaded: " + i.title + ". Open Upload Item to confirm.", t: Date.now() });
@@ -191,3 +249,4 @@ function render() {
   if (me && sec === "search") list();
 }
 render();
+startFirebase();
